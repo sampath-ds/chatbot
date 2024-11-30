@@ -1,0 +1,356 @@
+import streamlit as st
+from dotenv import load_dotenv, find_dotenv
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
+import psycopg2
+import os
+from groq import Groq
+from difflib import get_close_matches
+
+# Load environment variables
+_ = load_dotenv(find_dotenv())
+groq_api_key = os.getenv("GROQ_API_KEY")
+
+# Database credentials from environment
+db_user = os.getenv('DB_USER')
+db_password = os.getenv('DB_PASSWORD')
+db_host = os.getenv('DB_HOST', 'localhost')
+db_port = os.getenv('DB_PORT', '5432')
+database = os.getenv('DATABASE')
+
+# Initialize Groq client
+client = Groq(api_key=groq_api_key)
+
+# Function to initialize PostgreSQL connection
+def init_database():
+    try:
+        conn = psycopg2.connect(
+            dbname=database,
+            user=db_user,
+            password=db_password,
+            host=db_host,
+            port=db_port
+        )
+        return conn
+    except Exception as e:
+        st.error(f"Error connecting to the database: {e}")
+        return None
+
+# Function to fetch database schema information
+def get_schema(conn):
+    schema_info = ""
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT table_name, column_name, data_type
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                ORDER BY table_name, ordinal_position;
+            """)
+            tables = {}
+            for table, column, data_type in cursor.fetchall():
+                if table not in tables:
+                    tables[table] = []
+                tables[table].append(f"{column} ({data_type})")
+            for table, columns in tables.items():
+                schema_info += f"Table: {table}, Columns: {', '.join(columns)}\n"
+    except Exception as e:
+        st.error(f"Error fetching schema: {e}")
+    return schema_info
+
+def generate_query(user_query, schema, chat_history):
+    prompt = f"""
+You are a data analyst generating SQL queries based on the provided schema and conversation history.
+Only use data from the schema and ensure queries are based solely on the `teams`, `careers`, `articles`, and `practices` tables, ignoring any unrelated or external context.
+Absolutely **do not reference any generic, historical, or publicly known figures or data**—only refer to data that exists in these tables.
+
+Important:
+
+- **Make all matching case-insensitive** by using `ILIKE` for any textual filters (e.g., for `name`, `position`, `location`).
+- **Use case-sensitive column names exactly as they appear in the schema**.
+- Avoid using `LOWER()` on numeric fields or fields that contain ranges (e.g., `compensation`), and retrieve them directly without transformation.
+- When matching for positions (e.g., 'Partner' or 'Associate'), check if the `position` contains the target role as a substring.
+- **Do not use `UNNEST` on columns of type `text` or `varchar`**; only use `UNNEST` with array-type columns.
+- For array-type fields (e.g., `achievements`, `education`), use `UNNEST` to expand the array.
+- Always filter by `firm` when the question pertains to a specific firm.
+- Generate only the SQL code in one line without any explanation or additional text, and end the query with a semicolon.
+
+
+
+### Example Queries
+#### Team Member Queries (`teams`)
+#### Team Member Queries (`teams`)
+1. **Example Question:** "How many team members are there in total?"
+   **Expected SQL:** `SELECT COUNT(*) FROM teams;`
+
+#### Team Member Queries (`teams`)
+2. **Example Question:** "Who are founding partners for Rupp Pfalzgraf?"
+   **Expected SQL:** `SELECT name FROM teams WHERE position ILIKE '%founding partner%' AND firm ILIKE '%Rupp Pfalzgraf%';`
+
+3. **Example Question:** "Show information about a team member named Lauren Adornetto (case-insensitive)."
+   **Expected SQL:** `SELECT name, position, phone, email, education, about, achievements, admissions, affiliations FROM teams WHERE name ILIKE 'Lauren Adornetto';`
+
+4. **Example Question:** "What is the compensation range for a Litigation Attorney?"
+   **Expected SQL:** `SELECT position, compensation FROM careers WHERE position ILIKE '%Litigation Attorney%';`
+
+4. **Example Question:** "Who has admissions in New York?"
+   **Expected SQL:** `SELECT name, position FROM teams, UNNEST(admissions) AS admission WHERE admission ILIKE '%New York%';`
+
+5. **Example Question:** "List all members who received the 'Super Lawyers' recognition."
+   **Expected SQL:** `SELECT name FROM teams, UNNEST(achievements) AS achievement WHERE achievement ILIKE '%Super Lawyers%';`
+
+6. **Example Question:** "Who is admitted to practice in more than one state?"
+   **Expected SQL:** `SELECT name FROM teams WHERE CARDINALITY(admissions) > 1;`
+
+7. **Example Question:** "Which team members have admissions in multiple states and received awards from 2020 onward, ordered by award count from highest to lowest?"
+   **Expected SQL:** `SELECT name, COUNT(achievement) AS award_count FROM teams, UNNEST(achievements) AS achievement WHERE CARDINALITY(admissions) > 1 AND (achievement ILIKE '%2020%' OR achievement ILIKE '%2021%' OR achievement ILIKE '%2022%' OR achievement ILIKE '%2023%') GROUP BY name ORDER BY award_count DESC;`
+
+8. **Example Question:** "Who holds multiple titles or positions?"
+   **Expected SQL:** `SELECT name, position FROM teams WHERE position LIKE '%,%';`
+
+9. **Example Question:** "Which members attended University at Buffalo School of Law?"
+    **Expected SQL:** `SELECT name FROM teams, UNNEST(education) AS edu WHERE LOWER(edu) ILIKE '%university at buffalo school of law%';`
+
+10. **Example Question:** "List all partner team members by name."
+    **Expected SQL:** `SELECT name FROM teams WHERE position ILIKE '%Partner%';`
+
+11. **Example Question:** "What awards or achievements does Lauren Adornetto have?"
+    **Expected SQL:** `SELECT achievement FROM teams, UNNEST(achievements) AS achievement WHERE LOWER(name) = LOWER('Lauren Adornetto');`
+
+#### Career Queries (`careers`)
+1. **Example Question:** "List all available positions in Buffalo, NY."
+   **Expected SQL:** `SELECT position FROM careers WHERE location ILIKE '%Buffalo, NY%';`
+
+2. **Example Question:** "What positions are currently available?"
+   **Expected SQL:** `SELECT position FROM careers;`
+
+3. **Example Question:** "What is the compensation range for a Litigation Attorney?"
+   **Expected SQL:** `SELECT position, LOWER("compensation") AS min_comp, UPPER("compensation") AS max_comp FROM careers WHERE position ILIKE '%Litigation Attorney%';`
+
+4. **Example Question:** "What are the positions that require 2-5 years of experience?"
+   **Expected SQL:** `SELECT position FROM careers WHERE experience ILIKE '%2-5 years%';`
+
+5. **Example Question:** "List all full-time employment opportunities."
+   **Expected SQL:** `SELECT position FROM careers WHERE "employment type" ILIKE '%full-time%';`
+
+6. **Example Question:** "What is the pay rate for paralegal roles in Buffalo?"
+   **Expected SQL:** `SELECT position, LOWER("compensation") AS min_comp, UPPER("compensation") AS max_comp, "pay type" FROM careers WHERE position ILIKE '%paralegal%' AND location ILIKE '%Buffalo%';`
+
+7. **Example Question:** "How many unique positions are available in each city?"
+   **Expected SQL:** `SELECT location, COUNT(position) AS total_positions FROM careers GROUP BY location;`
+
+#### Article Queries (`articles`)
+1. **Example Question:** "Show articles related to the Technology area."
+   **Expected SQL:** `SELECT title FROM articles WHERE LOWER(area) ILIKE '%technology%' LIMIT 5;`
+
+2. **Example Question:** "Which articles focus on the Finance area?"
+   **Expected SQL:** `SELECT title FROM articles WHERE LOWER(area) ILIKE '%finance%';`
+
+3. **Example Question:** "Are there any articles discussing the Construction industry?"
+   **Expected SQL:** `SELECT title FROM articles WHERE LOWER(body) ILIKE '%construction%';`
+
+4. **Example Question:** "List articles discussing succession planning."
+   **Expected SQL:** `SELECT title FROM articles WHERE LOWER(body) ILIKE '%succession planning%';`
+
+#### Practice Queries (`practices`)
+1. **Example Question:** "List all practice titles and their specializations."
+   **Expected SQL:** `SELECT title, specializations FROM practices;`
+
+2. **Example Question:** "Which practice areas have ‘Cybersecurity’ as a specialization?"
+   **Expected SQL:** `SELECT title FROM practices, UNNEST(specializations) AS spec WHERE LOWER(spec) ILIKE '%cybersecurity%';`
+
+3. **Example Question:** "Who are the leaders in the Environmental Law practice?"
+   **Expected SQL:** `SELECT leaders FROM practices WHERE title ILIKE '%environmental law%';`
+
+4. **Example Question:** "Show all team members in the Immigration Law practice."
+   **Expected SQL:** `SELECT "team_members" FROM practices WHERE title ILIKE '%immigration law%';`
+
+5. **Example Question:** "Which practices include Sharon Prise Azurin as a team member?"
+   **Expected SQL:** `SELECT title FROM practices, UNNEST("team_members") AS member WHERE LOWER(member) ILIKE '%sharon prise azurin%';`
+
+6. **Example Question:** "What are the specializations for the Corporate and Business Law practice?"
+   **Expected SQL:** `SELECT specializations FROM practices WHERE title ILIKE '%corporate and business law%';`
+
+7. **Example Question:** "List all practices and their leaders."
+   **Expected SQL:** `SELECT title, leaders FROM practices;`
+
+8. **Example Question:** "Which team members work in both Environmental Law and Corporate and Business Law practices?"
+   **Expected SQL:** `SELECT DISTINCT member FROM ( SELECT UNNEST("team_members") AS member FROM practices WHERE title ILIKE '%environmental law%' INTERSECT SELECT UNNEST("team_members") AS member FROM practices WHERE title ILIKE '%corporate and business law%' ) AS common_members;`
+
+9. **Example Question:** "Find all practices with team members named 'Marc N. Aspis'."
+   **Expected SQL:** `SELECT title FROM practices, UNNEST("team_members") AS member WHERE LOWER(member) = LOWER('Marc N. Aspis');`
+
+10. **Example Question:** "Which practices are led by partners?"
+    **Expected SQL:** `SELECT title FROM practices, UNNEST(leaders) AS leader WHERE leader ILIKE '%partner%';`
+
+### Example Queries
+#### Team Member Queries (`teams`)
+1. **Example Question:** "How many team members are there in total?"
+   **Expected SQL:** `SELECT COUNT(*) FROM teams;`
+
+#### Team Member Queries (`teams`)
+2. **Example Question:** "Who are founding partners for Rupp Pfalzgraf?"
+   **Expected SQL:** `SELECT name FROM teams WHERE position ILIKE '%founding partner%' AND firm ILIKE '%Rupp Pfalzgraf%';`
+
+3. **Example Question:** "Show information about a team member named Lauren Adornetto (case-insensitive)."
+   **Expected SQL:** `SELECT name, position, phone, email, education, about, achievements, admissions, affiliations FROM teams WHERE name ILIKE 'Lauren Adornetto';`
+
+4. **Example Question:** "What is the compensation range for a Litigation Attorney?"
+   **Expected SQL:** `SELECT position, compensation FROM careers WHERE position ILIKE '%Litigation Attorney%';`
+
+
+Schema:
+{schema}
+
+Conversation History: {chat_history}
+
+Question: {user_query}
+
+Output only the SQL code:
+    """
+    
+    try:
+        # Append the user query to chat history immediately for display
+        st.session_state.chat_history.append(HumanMessage(content=user_query))
+
+        # Generate the SQL query
+        completion = client.chat.completions.create(
+            model="llama3-8b-8192",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            max_tokens=200,
+            top_p=1,
+            stream=False,
+            stop=[";"],  # Ensures query ends after the SQL statement.
+        )
+        generated_query = completion.choices[0].message.content.strip()
+
+        # Add a semicolon if it’s missing
+        if not generated_query.endswith(";"):
+            generated_query += ";"
+        
+        return generated_query
+    except Exception as e:
+        st.error(f"Error generating query with Groq API: {e}")
+        return None
+
+# Function to execute the SQL query on PostgreSQL and fetch results
+def execute_query(conn, query):
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(query)
+            columns = [desc[0] for desc in cursor.description]
+            results = cursor.fetchall()
+            return [dict(zip(columns, row)) for row in results]
+    except Exception as e:
+        st.error(f"Error executing query: {e}")
+        return None
+
+# Function to generate a conversational response based on query result
+def generate_conversational_response(user_query, result):
+    # Convert the result dictionary to a format that can be easily interpreted in natural language
+    data_description = "\n".join([", ".join([f"{key}: {value}" for key, value in record.items()]) for record in result])
+
+    # Create a prompt to generate a conversational answer
+    conversational_prompt = f"""
+You are a helpful assistant. A user has asked the following question: "{user_query}"
+
+Based on the data below, generate a natural language answer:
+
+Data:
+{data_description}
+
+Answer in a friendly and natural way:
+    """
+    
+    try:
+        completion = client.chat.completions.create(
+            model="llama3-8b-8192",
+            messages=[{"role": "user", "content": conversational_prompt}],
+            temperature=0.5,
+            max_tokens=300,
+            top_p=1,
+            stream=False,
+            stop=None,
+        )
+        conversational_response = completion.choices[0].message.content.strip()
+        return conversational_response
+    except Exception as e:
+        st.error(f"Error generating conversational response: {e}")
+        return None
+
+# Main function for the Streamlit app
+def main():
+    st.set_page_config(page_title="Chat with Your Database", page_icon=":page_with_curl:")
+    st.title("Data Visionaries: Your Gateway to Insights")
+
+    # Initialize database connection
+    conn = init_database()
+    if not conn:
+        st.stop()
+
+    # Fetch and display schema
+    schema = get_schema(conn)
+    if not schema:
+        st.error("Unable to fetch schema information.")
+        st.stop()
+
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = [
+            AIMessage(content="Let's get insights from your data!"),
+        ]
+
+    # Display chat history
+    for message in st.session_state.chat_history:
+        if isinstance(message, AIMessage):
+            with st.chat_message("assistant"):
+                st.markdown(message.content)
+        elif isinstance(message, HumanMessage):
+            with st.chat_message("user"):
+                st.markdown(message.content)
+
+    # User input
+    user_query = st.chat_input("Type a message...")
+    if user_query and user_query.strip():
+        # Immediately add user query to chat history for instant display
+        st.session_state.chat_history.append(HumanMessage(content=user_query))
+        
+        # Display the current question
+        with st.chat_message("user"):
+            st.markdown(user_query)
+
+        # Generate SQL query using Groq API
+        generated_query = generate_query(user_query, schema, st.session_state.chat_history)
+        if not generated_query:
+            st.error("Failed to generate a query.")
+            st.stop()
+
+        # Display generated query for debugging or transparency
+        st.write(f"**Generated Query:** {generated_query}")
+
+        # Execute the generated query
+        result = execute_query(conn, generated_query)
+        if result is None:
+            st.error("Failed to execute the query.")
+            st.stop()
+
+        # Generate a conversational response
+        conversational_response = generate_conversational_response(user_query, result)
+        if not conversational_response:
+            st.error("Failed to generate a conversational response.")
+            st.stop()
+
+        # Display the conversational response in the chat
+        with st.chat_message("assistant"):
+            st.markdown(f"**Answer:** {conversational_response}")
+
+        # Append AI response to chat history for future display
+        st.session_state.chat_history.append(AIMessage(content=conversational_response))
+
+    # Close the database connection at the end of the session
+    conn.close()
+
+if __name__ == "__main__":
+    main()
